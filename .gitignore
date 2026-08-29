@@ -1,2 +1,10 @@
 __pycache__/
 .mypy_cache/
+
+# Brad research output (public comments/usernames may be archived locally)
+brad_data/
+
+# Never commit Instagram authentication/session material
+session-*
+*.session
+.instaloader-session*
