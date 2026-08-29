@@ -1,36 +1,27 @@
 #!/usr/bin/env python3
-"""Test comment retrieval for Brad's newest known post using instagrapi.
-
-This is deliberately separate from collect_brad.py so we can prove that
-instagrapi can retrieve comments before changing the main archive pipeline.
-"""
+"""Test Brad comment retrieval with instagrapi using the existing Instaloader session."""
 
 from __future__ import annotations
 
-from getpass import getpass
-from pathlib import Path
-
 from instagrapi import Client
+import instaloader
 
 LOGIN_USERNAME = "weirdasshouses"
 POST_CODE = "DcjFwHPxTaP"
-SESSION_FILE = Path("brad_session.json")
 
 
 def login() -> Client:
+    """Reuse the already-working Instaloader session instead of logging in again."""
+    loader = instaloader.Instaloader()
+    loader.load_session_from_file(LOGIN_USERNAME)
+
+    sessionid = loader.context._session.cookies.get("sessionid")
+    if not sessionid:
+        raise RuntimeError("Could not find sessionid in the saved Instaloader session.")
+
     client = Client()
-
-    if SESSION_FILE.exists():
-        try:
-            client.load_settings(SESSION_FILE)
-            print(f"Loaded saved instagrapi session from {SESSION_FILE}.")
-        except Exception as exc:
-            print(f"Could not load saved session ({exc}); doing a fresh login.")
-
-    password = getpass(f"Instagram password for @{LOGIN_USERNAME}: ")
-    client.login(LOGIN_USERNAME, password)
-    client.dump_settings(SESSION_FILE)
-    print(f"Logged in as @{LOGIN_USERNAME}; saved session locally to {SESSION_FILE}.")
+    client.login_by_sessionid(sessionid)
+    print(f"Reused saved Instagram session for @{LOGIN_USERNAME}.")
     return client
 
 
