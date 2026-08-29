@@ -6,3 +6,4 @@ session-*
 *.session
 .instaloader-session*
 brad_session.json
+brad_browser_profile/
