@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
-"""Test Brad comment retrieval with instagrapi using the existing Instaloader session."""
+"""Test comment retrieval for Brad's newest known post using instagrapi.
+
+This reuses the already-working Instaloader login session instead of asking
+Instagram to authenticate the account a second time through instagrapi.
+"""
 
 from __future__ import annotations
 
-from instagrapi import Client
 import instaloader
+from instagrapi import Client
 
 LOGIN_USERNAME = "weirdasshouses"
 POST_CODE = "DcjFwHPxTaP"
 
 
 def login() -> Client:
-    """Reuse the already-working Instaloader session instead of logging in again."""
     loader = instaloader.Instaloader()
     loader.load_session_from_file(LOGIN_USERNAME)
 
     sessionid = loader.context._session.cookies.get("sessionid")
     if not sessionid:
-        raise RuntimeError("Could not find sessionid in the saved Instaloader session.")
+        raise RuntimeError("Could not find sessionid in the saved Instaloader cookie jar.")
 
     client = Client()
     client.login_by_sessionid(sessionid)
-    print(f"Reused saved Instagram session for @{LOGIN_USERNAME}.")
+    print(f"Reused existing Instagram session for @{LOGIN_USERNAME}.")
     return client
 
 
