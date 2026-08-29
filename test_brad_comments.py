@@ -18,7 +18,12 @@ def login() -> Client:
     loader = instaloader.Instaloader()
     loader.load_session_from_file(LOGIN_USERNAME)
 
-    sessionid = loader.context._session.cookies.get("sessionid")
+    sessionid = None
+    for cookie in loader.context._session.cookies:
+        if cookie.name == "sessionid":
+            sessionid = cookie.value
+            break
+
     if not sessionid:
         raise RuntimeError("Could not find sessionid in the saved Instaloader cookie jar.")
 
