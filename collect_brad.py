@@ -18,7 +18,7 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 
 import instaloader
 
@@ -54,15 +54,37 @@ class PostRow:
 
 
 def iso_utc(value: datetime) -> str:
-    """Return a stable UTC ISO-8601 timestamp."""
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).isoformat()
 
 
 def clean_markdown_text(text: str) -> str:
-    """Preserve text while making Markdown headings/spacing predictable."""
     return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def get_profile_posts(loader: instaloader.Instaloader, profile) -> Iterator:
+    """Iterate profile posts via Instagram's mobile feed endpoint.
+
+    Instagram retired the GraphQL doc_id used by Instaloader 4.15.3's
+    Profile.get_posts(). The mobile feed endpoint is the current upstream
+    fallback and avoids that dead query while leaving Instaloader core intact.
+    """
+    max_id = None
+    while True:
+        params = {"count": 12}
+        if max_id is not None:
+            params["max_id"] = max_id
+        data = loader.context.get_json(
+            f"api/v1/feed/user/{profile.userid}/",
+            params=params,
+        )
+        for item in data.get("items", []):
+            yield instaloader.Post.from_iphone_struct(loader.context, item)
+
+        if not data.get("more_available") or not data.get("next_max_id"):
+            break
+        max_id = data["next_max_id"]
 
 
 def comment_to_row(post, comment, parent_id: Optional[int] = None) -> CommentRow:
@@ -158,14 +180,12 @@ def write_post_markdown(post, comments: list[CommentRow], output_dir: Path) -> N
 def write_master_files(posts: list[PostRow], comments: list[CommentRow], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    posts_csv = output_dir / "posts.csv"
-    with posts_csv.open("w", encoding="utf-8", newline="") as f:
+    with (output_dir / "posts.csv").open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(PostRow.__dataclass_fields__.keys()))
         writer.writeheader()
         writer.writerows(asdict(row) for row in posts)
 
-    comments_csv = output_dir / "comments.csv"
-    with comments_csv.open("w", encoding="utf-8", newline="") as f:
+    with (output_dir / "comments.csv").open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(CommentRow.__dataclass_fields__.keys()))
         writer.writeheader()
         writer.writerows(asdict(row) for row in comments)
@@ -180,7 +200,6 @@ def write_master_files(posts: list[PostRow], comments: list[CommentRow], output_
 
 
 def login(loader: instaloader.Instaloader, username: str) -> None:
-    """Load a saved Instaloader session, or prompt for an Instagram login once."""
     try:
         loader.load_session_from_file(username)
         print(f"Loaded saved Instagram session for @{username}.")
@@ -214,14 +233,14 @@ def collect(args: argparse.Namespace) -> int:
     all_posts: list[PostRow] = []
     all_comments: list[CommentRow] = []
 
-    for index, post in enumerate(profile.get_posts(), start=1):
+    for index, post in enumerate(get_profile_posts(loader, profile), start=1):
         if args.limit and index > args.limit:
             break
 
         print(f"[{index}] Collecting {post.shortcode} ({post.date_utc:%Y-%m-%d}) …")
         try:
             comments = flatten_comments(post, post.get_comments())
-        except Exception as exc:  # preserve completed posts if Instagram changes mid-run
+        except Exception as exc:
             print(f"WARNING: could not collect comments for {post.shortcode}: {exc}", file=sys.stderr)
             comments = []
 
@@ -240,8 +259,6 @@ def collect(args: argparse.Namespace) -> int:
                 comments_collected=len(comments),
             )
         )
-
-        # Rewrite after every post so an interrupted run still leaves usable data.
         write_master_files(all_posts, all_comments, output_dir)
 
     print(
