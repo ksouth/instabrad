@@ -5,3 +5,4 @@ __pycache__/
 session-*
 *.session
 .instaloader-session*
+brad_session.json
