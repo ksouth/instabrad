@@ -112,7 +112,7 @@ def extract_rows(page) -> list[dict]:
     containers when timestamps are absent.
     """
     return page.evaluate(
-        """
+        r"""
         () => {
           const root = document.querySelector('article') || document.body;
           const rows = [];
@@ -151,9 +151,6 @@ def extract_rows(page) -> list[dict]:
             rows.push({username, text, timestamp, source});
           }
 
-          // Strategy 1: every visible timestamp is usually attached to a caption,
-          // comment, or reply. Walk upward until we find the smallest container
-          // that also contains a profile link and meaningful text.
           for (const time of root.querySelectorAll('time')) {
             let el = time.parentElement;
             let best = null;
@@ -169,13 +166,10 @@ def extract_rows(page) -> list[dict]:
             add(best, 'time-anchor');
           }
 
-          // Strategy 2: list/listitem layouts used by some Instagram builds.
           for (const el of root.querySelectorAll('li, [role="listitem"]')) {
             add(el, 'listitem');
           }
 
-          // Strategy 3: fallback around profile links. Walk up a few levels and
-          // retain compact containers that include a time element or reply/like UI.
           for (const a of root.querySelectorAll('a[href^="/"]')) {
             let el = a.parentElement;
             for (let depth = 0; el && depth < 5; depth++, el = el.parentElement) {
@@ -212,7 +206,6 @@ def main() -> None:
         print("If Instagram asks you to log in, log into @weirdasshouses in that browser.")
         input("Once you can see Instagram normally, press Return here. The script will take over... ")
 
-        # Always return to the exact benchmark post regardless of where login/navigation took us.
         page.goto(POST_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(3000)
 
