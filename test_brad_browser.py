@@ -5,9 +5,9 @@ Uses a dedicated persistent Playwright profile stored locally in
 ``brad_browser_profile``. On first run, log into Instagram manually in the
 browser window that opens. The login state is then reused on future runs.
 
-This test targets the high-comment Brad post chosen as the benchmark and tries
-multiple DOM strategies so we are not dependent on one brittle Instagram CSS
-layout.
+This test targets the high-comment Brad post chosen as the benchmark and
+captures comment rows continuously while scrolling so Instagram's virtualized
+DOM cannot discard comments before we archive them.
 """
 
 from __future__ import annotations
@@ -52,15 +52,20 @@ def click_expanders(page) -> int:
 
 
 def scroll_comment_surfaces(page) -> None:
-    """Scroll the page and any independently scrollable Instagram panels."""
+    """Advance the page and independently scrollable Instagram panels.
+
+    We move in viewport-sized steps instead of jumping straight to the end so
+    virtualized comment rows have a chance to appear and be captured.
+    """
     page.evaluate(
-        """
+        r"""
         () => {
-          window.scrollTo(0, document.body.scrollHeight);
+          window.scrollBy(0, Math.max(window.innerHeight * 0.8, 600));
           const els = [...document.querySelectorAll('div, section, main, article')];
           for (const el of els) {
             if (el.scrollHeight > el.clientHeight + 150 && el.clientHeight > 180) {
-              el.scrollTop = el.scrollHeight;
+              const step = Math.max(el.clientHeight * 0.8, 500);
+              el.scrollTop = Math.min(el.scrollTop + step, el.scrollHeight);
             }
           }
         }
@@ -68,49 +73,8 @@ def scroll_comment_surfaces(page) -> None:
     )
 
 
-def load_more(page, rounds: int = 80) -> None:
-    """Expand/scroll until the page stops visibly changing for several rounds."""
-    stable = 0
-    previous = ""
-
-    for round_no in range(1, rounds + 1):
-        clicked = click_expanders(page)
-        scroll_comment_surfaces(page)
-        page.wait_for_timeout(700)
-
-        signature = page.evaluate(
-            """
-            () => {
-              const article = document.querySelector('article') || document.body;
-              return [
-                article.innerText.length,
-                article.querySelectorAll('time').length,
-                article.querySelectorAll('a[href^="/"]').length
-              ].join(':');
-            }
-            """
-        )
-
-        if signature == previous and clicked == 0:
-            stable += 1
-        else:
-            stable = 0
-        previous = signature
-
-        print(f"Loading round {round_no}: page signature {signature}, expand clicks {clicked}")
-        if stable >= 5:
-            print("Page stopped changing; moving to extraction.")
-            break
-
-
 def extract_rows(page) -> list[dict]:
-    """Extract comment-like records from the rendered post.
-
-    Current Instagram markup varies between post types and experiments. We use
-    timestamps as anchors when possible, then inspect nearby containers for a
-    profile link and human-visible text. A fallback scans repeated profile-link
-    containers when timestamps are absent.
-    """
+    """Extract comment-like records from the currently rendered post DOM."""
     return page.evaluate(
         r"""
         () => {
@@ -151,6 +115,7 @@ def extract_rows(page) -> list[dict]:
             rows.push({username, text, timestamp, source});
           }
 
+          // Strategy 1: timestamp anchors usually identify captions/comments/replies.
           for (const time of root.querySelectorAll('time')) {
             let el = time.parentElement;
             let best = null;
@@ -166,10 +131,12 @@ def extract_rows(page) -> list[dict]:
             add(best, 'time-anchor');
           }
 
+          // Strategy 2: list/listitem layouts used by some Instagram builds.
           for (const el of root.querySelectorAll('li, [role="listitem"]')) {
             add(el, 'listitem');
           }
 
+          // Strategy 3: compact containers around profile links.
           for (const a of root.querySelectorAll('a[href^="/"]')) {
             let el = a.parentElement;
             for (let depth = 0; el && depth < 5; depth++, el = el.parentElement) {
@@ -186,6 +153,79 @@ def extract_rows(page) -> list[dict]:
         }
         """
     )
+
+
+def row_key(row: dict) -> tuple[str, str, str]:
+    """Stable-enough dedupe key for the benchmark archive."""
+    return (
+        row.get("username", ""),
+        row.get("text", ""),
+        row.get("timestamp", ""),
+    )
+
+
+def merge_rows(archive: dict[tuple[str, str, str], dict], rows: list[dict]) -> int:
+    """Merge currently mounted rows into the persistent in-memory archive."""
+    added = 0
+    for row in rows:
+        key = row_key(row)
+        if key not in archive:
+            archive[key] = row
+            added += 1
+    return added
+
+
+def load_more(page, rounds: int = 300) -> list[dict]:
+    """Expand, capture, and scroll until no new rows appear for several rounds."""
+    archive: dict[tuple[str, str, str], dict] = {}
+    quiet_rounds = 0
+
+    # Capture the initial viewport before touching the page.
+    initial = extract_rows(page)
+    merge_rows(archive, initial)
+    print(f"Initial capture: {len(initial)} visible rows, {len(archive)} unique rows archived")
+
+    for round_no in range(1, rounds + 1):
+        # Capture before clicking in case virtualization removes current rows.
+        before = extract_rows(page)
+        added_before = merge_rows(archive, before)
+
+        clicked = click_expanders(page)
+        page.wait_for_timeout(350)
+
+        # Capture newly expanded replies/comments before scrolling them away.
+        after_click = extract_rows(page)
+        added_click = merge_rows(archive, after_click)
+
+        scroll_comment_surfaces(page)
+        page.wait_for_timeout(800)
+
+        # Capture the new virtualized window after scrolling.
+        after_scroll = extract_rows(page)
+        added_scroll = merge_rows(archive, after_scroll)
+
+        new_rows = added_before + added_click + added_scroll
+        visible_now = len(after_scroll)
+
+        print(
+            f"Loading round {round_no}: visible {visible_now}, "
+            f"new +{new_rows}, total unique {len(archive)}, expand clicks {clicked}"
+        )
+
+        if new_rows == 0 and clicked == 0:
+            quiet_rounds += 1
+        else:
+            quiet_rounds = 0
+
+        # Eight dead passes is deliberately conservative. Virtualized lists can
+        # pause briefly while Instagram fetches another page of comments.
+        if quiet_rounds >= 8:
+            print("No new rows or expansion controls for 8 rounds; moving to final extraction.")
+            break
+
+    final_rows = extract_rows(page)
+    merge_rows(archive, final_rows)
+    return list(archive.values())
 
 
 def main() -> None:
@@ -206,14 +246,14 @@ def main() -> None:
         print("If Instagram asks you to log in, log into @weirdasshouses in that browser.")
         input("Once you can see Instagram normally, press Return here. The script will take over... ")
 
+        # Always return to the exact benchmark post regardless of where login/navigation took us.
         page.goto(POST_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(3000)
 
-        print("Automatically expanding and scrolling comments/replies now...")
-        load_more(page)
+        print("Automatically expanding, capturing, and scrolling comments/replies now...")
+        rows = load_more(page)
 
-        rows = extract_rows(page)
-        print(f"Extracted {len(rows)} candidate comment/caption rows.")
+        print(f"Archived {len(rows)} unique candidate comment/caption rows across the whole run.")
         for index, row in enumerate(rows[:15], start=1):
             sample = row["text"].replace("\n", " | ")[:220]
             print(f"{index}. @{row['username']} [{row['source']}]: {sample}")
