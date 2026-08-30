@@ -5,8 +5,11 @@ Uses a dedicated persistent Playwright profile stored locally in
 ``brad_browser_profile``. This test targets the benchmark post and combines
 rendered DOM extraction with Instagram's own structured comment objects.
 
-The important rule: comments are deduplicated by Instagram comment ID whenever
-available. A single account may leave any number of distinct comments.
+The important rules:
+- comments are deduplicated by Instagram comment ID whenever available;
+- a single account may leave any number of distinct comments;
+- the collector scrolls only the independently scrollable comments panel,
+  never the webpage/window.
 """
 
 from __future__ import annotations
@@ -51,19 +54,131 @@ def click_expanders(page) -> int:
     return clicked
 
 
-def scroll_comment_surfaces(page) -> None:
-    """Advance the page and independently scrollable Instagram panels."""
-    page.evaluate(
+def select_comment_scroller(page) -> dict:
+    """Find and mark the independently scrollable surface containing comments."""
+    return page.evaluate(
         r"""
         () => {
-          window.scrollBy(0, Math.max(window.innerHeight * 0.8, 600));
-          const els = [...document.querySelectorAll('div, section, main, article')];
-          for (const el of els) {
-            if (el.scrollHeight > el.clientHeight + 150 && el.clientHeight > 180) {
-              const step = Math.max(el.clientHeight * 0.8, 500);
-              el.scrollTop = Math.min(el.scrollTop + step, el.scrollHeight);
-            }
+          for (const el of document.querySelectorAll('[data-instabrad-scroller]')) {
+            el.removeAttribute('data-instabrad-scroller');
           }
+
+          const candidates = [];
+          const all = [...document.querySelectorAll('div, section, main, article, ul')];
+
+          for (const el of all) {
+            const style = getComputedStyle(el);
+            const overflowY = style.overflowY;
+            const genuinelyScrollable =
+              el.scrollHeight > el.clientHeight + 100 &&
+              el.clientHeight >= 180 &&
+              ['auto', 'scroll', 'overlay'].includes(overflowY);
+
+            if (!genuinelyScrollable) continue;
+
+            const commentLinks = el.querySelectorAll('a[href*="/c/"]').length;
+            const times = el.querySelectorAll('time').length;
+            const text = (el.innerText || '').slice(0, 20000);
+            const replyMentions = (text.match(/\bReply\b/gi) || []).length;
+            const viewReplyMentions = (text.match(/View .*repl(?:y|ies)/gi) || []).length;
+            const hasPost = !!el.closest('article') || !!el.querySelector('article');
+
+            const score =
+              commentLinks * 1000 +
+              times * 20 +
+              replyMentions * 8 +
+              viewReplyMentions * 30 +
+              (hasPost ? 50 : 0);
+
+            candidates.push({
+              el,
+              score,
+              commentLinks,
+              times,
+              replyMentions,
+              viewReplyMentions,
+              scrollTop: el.scrollTop,
+              scrollHeight: el.scrollHeight,
+              clientHeight: el.clientHeight,
+              overflowY
+            });
+          }
+
+          candidates.sort((a, b) => b.score - a.score);
+          const best = candidates[0];
+          if (!best) return {found: false};
+
+          best.el.dataset.instabradScroller = '1';
+          return {
+            found: true,
+            score: best.score,
+            commentLinks: best.commentLinks,
+            times: best.times,
+            replyMentions: best.replyMentions,
+            viewReplyMentions: best.viewReplyMentions,
+            scrollTop: best.scrollTop,
+            scrollHeight: best.scrollHeight,
+            clientHeight: best.clientHeight,
+            overflowY: best.overflowY
+          };
+        }
+        """
+    )
+
+
+def scroll_comments(page) -> dict:
+    """Scroll only the selected Instagram comment panel, never window."""
+    info = page.evaluate(
+        r"""
+        () => {
+          const el = document.querySelector('[data-instabrad-scroller="1"]');
+          if (!el) return {ok: false};
+
+          const before = el.scrollTop;
+          const step = Math.max(300, el.clientHeight * 0.70);
+          const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+          el.scrollTop = Math.min(el.scrollTop + step, maxTop);
+          el.dispatchEvent(new Event('scroll', {bubbles: true}));
+
+          return {
+            ok: true,
+            before,
+            after: el.scrollTop,
+            scrollHeight: el.scrollHeight,
+            clientHeight: el.clientHeight,
+            atBottom: el.scrollTop >= maxTop - 2
+          };
+        }
+        """
+    )
+
+    if info.get("ok"):
+        return info
+
+    # React can occasionally replace the panel node. Re-select it rather than
+    # falling back to scrolling the webpage.
+    selected = select_comment_scroller(page)
+    if not selected.get("found"):
+        return {"ok": False}
+
+    return page.evaluate(
+        r"""
+        () => {
+          const el = document.querySelector('[data-instabrad-scroller="1"]');
+          if (!el) return {ok: false};
+          const before = el.scrollTop;
+          const step = Math.max(300, el.clientHeight * 0.70);
+          const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+          el.scrollTop = Math.min(el.scrollTop + step, maxTop);
+          el.dispatchEvent(new Event('scroll', {bubbles: true}));
+          return {
+            ok: true,
+            before,
+            after: el.scrollTop,
+            scrollHeight: el.scrollHeight,
+            clientHeight: el.clientHeight,
+            atBottom: el.scrollTop >= maxTop - 2
+          };
         }
         """
     )
@@ -279,9 +394,19 @@ def capture_all_sources(page, archive: dict[tuple[str, ...], dict]) -> tuple[int
 
 
 def load_more(page, rounds: int = 300) -> list[dict]:
-    """Expand, capture, and scroll until no new comment IDs appear."""
+    """Expand, capture, and scroll the comments panel until it stops yielding IDs."""
     archive: dict[tuple[str, ...], dict] = {}
     quiet_rounds = 0
+
+    scroller = select_comment_scroller(page)
+    if not scroller.get("found"):
+        raise RuntimeError("Could not find Instagram's independently scrollable comments panel.")
+
+    print(
+        "Selected comments panel: "
+        f"scroll={scroller['scrollTop']:.0f}/{scroller['scrollHeight']} "
+        f"viewport={scroller['clientHeight']} comment-links={scroller['commentLinks']}"
+    )
 
     dom_n, structured_n, added = capture_all_sources(page, archive)
     print(
@@ -291,11 +416,16 @@ def load_more(page, rounds: int = 300) -> list[dict]:
 
     for round_no in range(1, rounds + 1):
         _, _, added_before = capture_all_sources(page, archive)
+
         clicked = click_expanders(page)
-        page.wait_for_timeout(350)
+        page.wait_for_timeout(750)
         _, _, added_click = capture_all_sources(page, archive)
-        scroll_comment_surfaces(page)
-        page.wait_for_timeout(800)
+
+        scroll_info = scroll_comments(page)
+        if not scroll_info.get("ok"):
+            raise RuntimeError("Lost the Instagram comments panel while collecting.")
+
+        page.wait_for_timeout(1200)
         dom_n, structured_n, added_scroll = capture_all_sources(page, archive)
 
         new_rows = added_before + added_click + added_scroll
@@ -305,16 +435,19 @@ def load_more(page, rounds: int = 300) -> list[dict]:
         print(
             f"Loading round {round_no}: DOM {dom_n}, structured {structured_n}, "
             f"new +{new_rows}, unique IDs {comment_ids}, replies {replies}, "
-            f"expand clicks {clicked}"
+            f"expand clicks {clicked}, "
+            f"comment-scroll {scroll_info['before']:.0f}->{scroll_info['after']:.0f}/"
+            f"{scroll_info['scrollHeight']}"
         )
 
-        if new_rows == 0 and clicked == 0:
+        moved = abs(float(scroll_info.get("after", 0)) - float(scroll_info.get("before", 0))) > 1
+        if new_rows == 0 and clicked == 0 and not moved:
             quiet_rounds += 1
         else:
             quiet_rounds = 0
 
         if quiet_rounds >= 8:
-            print("No new comment IDs or expansion controls for 8 rounds; stopping.")
+            print("No new comment IDs, expansion controls, or comment-panel movement for 8 rounds; stopping.")
             break
 
     capture_all_sources(page, archive)
@@ -342,7 +475,7 @@ def main() -> None:
         page.goto(POST_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(3000)
 
-        print("Automatically expanding, capturing, and scrolling comments/replies now...")
+        print("Automatically expanding, capturing, and scrolling ONLY the comments panel now...")
         rows = load_more(page)
 
         comments = [row for row in rows if row.get("comment_id")]
