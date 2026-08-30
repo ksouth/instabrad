@@ -4,6 +4,10 @@
 Reuses test_brad_browser.py but replaces its batch expander with a slower
 version that clicks one visible expansion control inside the selected comments
 panel, then waits for Instagram to react before clicking another.
+
+This benchmark also replaces direct ``scrollTop`` mutation with real Playwright
+mouse-wheel input over the comments panel. Manual scrolling proved that Instagram
+loads additional comments in response to a genuine scroll gesture.
 """
 
 from __future__ import annotations
@@ -88,6 +92,51 @@ def click_expanders_slow(page, max_clicks: int = 80) -> int:
     return clicked
 
 
+def scroll_comments_with_wheel(page) -> dict:
+    """Send a genuine mouse-wheel gesture over the selected comments panel."""
+    panel = page.locator('[data-instabrad-scroller="1"]')
+    if panel.count() == 0:
+        selected = base.select_comment_scroller(page)
+        if not selected.get("found"):
+            return {"ok": False}
+        panel = page.locator('[data-instabrad-scroller="1"]')
+
+    try:
+        box = panel.bounding_box()
+    except Exception:
+        box = None
+
+    if not box:
+        return {"ok": False}
+
+    before = panel.evaluate(
+        "el => ({scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight})"
+    )
+
+    # Put the pointer squarely inside the comment surface, then perform the same
+    # kind of wheel gesture a person makes with a mouse/trackpad.
+    x = box["x"] + box["width"] * 0.5
+    y = box["y"] + box["height"] * 0.65
+    page.mouse.move(x, y)
+    page.mouse.wheel(0, max(500, int(box["height"] * 0.8)))
+    page.wait_for_timeout(500)
+
+    after = panel.evaluate(
+        "el => ({scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight})"
+    )
+
+    max_top = max(0, after["scrollHeight"] - after["clientHeight"])
+    return {
+        "ok": True,
+        "before": before["scrollTop"],
+        "after": after["scrollTop"],
+        "scrollHeight": after["scrollHeight"],
+        "clientHeight": after["clientHeight"],
+        "atBottom": after["scrollTop"] >= max_top - 2,
+    }
+
+
 if __name__ == "__main__":
     base.click_expanders = click_expanders_slow
+    base.scroll_comments = scroll_comments_with_wheel
     base.main()
