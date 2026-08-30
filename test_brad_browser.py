@@ -109,7 +109,10 @@ def extract_rows(page) -> list[dict]:
             if (text.length > 5000) return;
             const timeEl = el.querySelector('time');
             const timestamp = timeEl ? (timeEl.getAttribute('datetime') || timeEl.innerText || '') : '';
-            const key = username + '\n' + text + '\n' + timestamp;
+            const normalizedText = text.replace(/\s+/g, ' ').trim();
+            const key = timestamp
+              ? username + '\n' + timestamp
+              : username + '\nNO_TIMESTAMP\n' + normalizedText;
             if (seen.has(key)) return;
             seen.add(key);
             rows.push({username, text, timestamp, source});
@@ -155,13 +158,22 @@ def extract_rows(page) -> list[dict]:
     )
 
 
+def normalize_text(text: str) -> str:
+    return " ".join((text or "").split())
+
+
 def row_key(row: dict) -> tuple[str, str, str]:
-    """Stable-enough dedupe key for the benchmark archive."""
-    return (
-        row.get("username", ""),
-        row.get("text", ""),
-        row.get("timestamp", ""),
-    )
+    """Deduplicate one Instagram item across multiple DOM extraction strategies.
+
+    Instagram timestamps are precise enough to identify the same rendered item
+    when combined with username. Rows without timestamps fall back to normalized
+    visible text so separate untimestamped rows from the same account are kept.
+    """
+    username = row.get("username", "")
+    timestamp = row.get("timestamp", "")
+    if timestamp:
+        return (username, "timestamp", timestamp)
+    return (username, "text", normalize_text(row.get("text", "")))
 
 
 def merge_rows(archive: dict[tuple[str, str, str], dict], rows: list[dict]) -> int:
@@ -180,27 +192,23 @@ def load_more(page, rounds: int = 300) -> list[dict]:
     archive: dict[tuple[str, str, str], dict] = {}
     quiet_rounds = 0
 
-    # Capture the initial viewport before touching the page.
     initial = extract_rows(page)
     merge_rows(archive, initial)
     print(f"Initial capture: {len(initial)} visible rows, {len(archive)} unique rows archived")
 
     for round_no in range(1, rounds + 1):
-        # Capture before clicking in case virtualization removes current rows.
         before = extract_rows(page)
         added_before = merge_rows(archive, before)
 
         clicked = click_expanders(page)
         page.wait_for_timeout(350)
 
-        # Capture newly expanded replies/comments before scrolling them away.
         after_click = extract_rows(page)
         added_click = merge_rows(archive, after_click)
 
         scroll_comment_surfaces(page)
         page.wait_for_timeout(800)
 
-        # Capture the new virtualized window after scrolling.
         after_scroll = extract_rows(page)
         added_scroll = merge_rows(archive, after_scroll)
 
@@ -217,8 +225,6 @@ def load_more(page, rounds: int = 300) -> list[dict]:
         else:
             quiet_rounds = 0
 
-        # Eight dead passes is deliberately conservative. Virtualized lists can
-        # pause briefly while Instagram fetches another page of comments.
         if quiet_rounds >= 8:
             print("No new rows or expansion controls for 8 rounds; moving to final extraction.")
             break
@@ -246,7 +252,6 @@ def main() -> None:
         print("If Instagram asks you to log in, log into @weirdasshouses in that browser.")
         input("Once you can see Instagram normally, press Return here. The script will take over... ")
 
-        # Always return to the exact benchmark post regardless of where login/navigation took us.
         page.goto(POST_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(3000)
 
