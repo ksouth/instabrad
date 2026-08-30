@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Browser-backed proof-of-concept for Brad comment collection.
+"""Browser-backed benchmark for Brad comment collection.
 
 Uses a dedicated persistent Playwright profile stored locally in
-``brad_browser_profile``. On first run, log into Instagram manually in the
-browser window that opens. The login state is then reused on future runs.
+``brad_browser_profile``. This test targets the benchmark post and combines
+rendered DOM extraction with Instagram's own structured comment objects.
 
-This test targets the high-comment Brad post chosen as the benchmark and
-captures comment rows continuously while scrolling so Instagram's virtualized
-DOM cannot discard comments before we archive them.
+The important rule: comments are deduplicated by Instagram comment ID whenever
+available. A single account may leave any number of distinct comments.
 """
 
 from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -52,11 +52,7 @@ def click_expanders(page) -> int:
 
 
 def scroll_comment_surfaces(page) -> None:
-    """Advance the page and independently scrollable Instagram panels.
-
-    We move in viewport-sized steps instead of jumping straight to the end so
-    virtualized comment rows have a chance to appear and be captured.
-    """
+    """Advance the page and independently scrollable Instagram panels."""
     page.evaluate(
         r"""
         () => {
@@ -73,8 +69,8 @@ def scroll_comment_surfaces(page) -> None:
     )
 
 
-def extract_rows(page) -> list[dict]:
-    """Extract comment-like records from the currently rendered post DOM."""
+def extract_dom_rows(page) -> list[dict]:
+    """Extract rendered comment-like records, including Instagram comment IDs."""
     return page.evaluate(
         r"""
         () => {
@@ -95,6 +91,16 @@ def extract_rows(page) -> list[dict]:
             return '';
           }
 
+          function commentIdFrom(el) {
+            const links = [...el.querySelectorAll('a[href*="/c/"]')];
+            for (const a of links) {
+              const href = a.getAttribute('href') || '';
+              const m = href.match(/\/c\/(\d+)\/?/);
+              if (m) return m[1];
+            }
+            return '';
+          }
+
           function usefulText(el) {
             const clone = el.cloneNode(true);
             for (const bad of clone.querySelectorAll('svg, img, video')) bad.remove();
@@ -105,20 +111,27 @@ def extract_rows(page) -> list[dict]:
             if (!el) return;
             const username = usernameFrom(el);
             const text = usefulText(el);
-            if (!username || !text) return;
-            if (text.length > 5000) return;
+            if (!username || !text || text.length > 5000) return;
             const timeEl = el.querySelector('time');
             const timestamp = timeEl ? (timeEl.getAttribute('datetime') || timeEl.innerText || '') : '';
+            const comment_id = commentIdFrom(el);
             const normalizedText = text.replace(/\s+/g, ' ').trim();
-            const key = timestamp
-              ? username + '\n' + timestamp
-              : username + '\nNO_TIMESTAMP\n' + normalizedText;
+            const key = comment_id || (username + '\n' + timestamp + '\n' + normalizedText);
             if (seen.has(key)) return;
             seen.add(key);
-            rows.push({username, text, timestamp, source});
+            rows.push({
+              comment_id,
+              parent_comment_id: '',
+              username,
+              text,
+              timestamp,
+              likes: null,
+              child_comment_count: null,
+              is_reply: null,
+              source
+            });
           }
 
-          // Strategy 1: timestamp anchors usually identify captions/comments/replies.
           for (const time of root.querySelectorAll('time')) {
             let el = time.parentElement;
             let best = null;
@@ -128,28 +141,15 @@ def extract_rows(page) -> list[dict]:
               const t = usefulText(el);
               if (u && t && t.length < 5000) {
                 best = el;
+                if (commentIdFrom(el)) break;
                 if (el.matches('li, [role="listitem"]')) break;
               }
             }
-            add(best, 'time-anchor');
+            add(best, 'dom-time-anchor');
           }
 
-          // Strategy 2: list/listitem layouts used by some Instagram builds.
           for (const el of root.querySelectorAll('li, [role="listitem"]')) {
-            add(el, 'listitem');
-          }
-
-          // Strategy 3: compact containers around profile links.
-          for (const a of root.querySelectorAll('a[href^="/"]')) {
-            let el = a.parentElement;
-            for (let depth = 0; el && depth < 5; depth++, el = el.parentElement) {
-              if (!root.contains(el)) break;
-              const txt = usefulText(el);
-              if (txt && txt.length < 1800 && (el.querySelector('time') || /reply|like/i.test(txt))) {
-                add(el, 'profile-anchor');
-                break;
-              }
-            }
+            add(el, 'dom-listitem');
           }
 
           return rows;
@@ -158,66 +158,154 @@ def extract_rows(page) -> list[dict]:
     )
 
 
+def extract_structured_comments(page) -> list[dict]:
+    """Find Instagram XDTCommentDict objects embedded in JSON script payloads."""
+    raw = page.evaluate(
+        r"""
+        () => {
+          const out = [];
+          const seen = new Set();
+
+          function visit(value) {
+            if (!value || typeof value !== 'object') return;
+            if (Array.isArray(value)) {
+              for (const item of value) visit(item);
+              return;
+            }
+
+            const looksLikeComment =
+              value.__typename === 'XDTCommentDict' ||
+              (value.pk && typeof value.text === 'string' && value.user && value.user.username);
+
+            if (looksLikeComment) {
+              const id = String(value.pk || value.id || '');
+              if (id && !seen.has(id)) {
+                seen.add(id);
+                out.push({
+                  comment_id: id,
+                  parent_comment_id: value.parent_comment_id ? String(value.parent_comment_id) : '',
+                  username: value.user?.username || '',
+                  text: value.text || '',
+                  created_at: value.created_at || null,
+                  likes: value.comment_like_count ?? null,
+                  child_comment_count: value.child_comment_count ?? null,
+                  is_edited: value.is_edited ?? null
+                });
+              }
+            }
+
+            for (const child of Object.values(value)) visit(child);
+          }
+
+          for (const script of document.querySelectorAll('script[type="application/json"]')) {
+            const text = script.textContent || '';
+            if (!text || text.length > 20000000) continue;
+            try {
+              visit(JSON.parse(text));
+            } catch (_) {}
+          }
+          return out;
+        }
+        """
+    )
+
+    rows: list[dict] = []
+    for item in raw:
+        created_at = item.get("created_at")
+        timestamp = ""
+        if isinstance(created_at, (int, float)):
+            timestamp = datetime.fromtimestamp(created_at, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        parent = item.get("parent_comment_id") or ""
+        rows.append(
+            {
+                "comment_id": item.get("comment_id", ""),
+                "parent_comment_id": parent,
+                "username": item.get("username", ""),
+                "text": item.get("text", ""),
+                "timestamp": timestamp,
+                "likes": item.get("likes"),
+                "child_comment_count": item.get("child_comment_count"),
+                "is_reply": bool(parent),
+                "is_edited": item.get("is_edited"),
+                "source": "instagram-structured-json",
+            }
+        )
+    return rows
+
+
 def normalize_text(text: str) -> str:
     return " ".join((text or "").split())
 
 
-def row_key(row: dict) -> tuple[str, str, str]:
-    """Deduplicate one Instagram item across multiple DOM extraction strategies.
+def row_key(row: dict) -> tuple[str, ...]:
+    """Use Instagram comment ID first; fall back only for caption/odd DOM rows."""
+    comment_id = str(row.get("comment_id") or "")
+    if comment_id:
+        return ("comment_id", comment_id)
+    return (
+        "fallback",
+        row.get("username", ""),
+        row.get("timestamp", ""),
+        normalize_text(row.get("text", "")),
+    )
 
-    Instagram timestamps are precise enough to identify the same rendered item
-    when combined with username. Rows without timestamps fall back to normalized
-    visible text so separate untimestamped rows from the same account are kept.
-    """
-    username = row.get("username", "")
-    timestamp = row.get("timestamp", "")
-    if timestamp:
-        return (username, "timestamp", timestamp)
-    return (username, "text", normalize_text(row.get("text", "")))
 
-
-def merge_rows(archive: dict[tuple[str, str, str], dict], rows: list[dict]) -> int:
-    """Merge currently mounted rows into the persistent in-memory archive."""
+def merge_rows(archive: dict[tuple[str, ...], dict], rows: list[dict]) -> int:
+    """Merge rows, preferring richer structured Instagram data for a known ID."""
     added = 0
     for row in rows:
         key = row_key(row)
         if key not in archive:
             archive[key] = row
             added += 1
+            continue
+
+        existing = archive[key]
+        if row.get("source") == "instagram-structured-json":
+            merged = dict(existing)
+            for field, value in row.items():
+                if value not in (None, ""):
+                    merged[field] = value
+            archive[key] = merged
     return added
 
 
+def capture_all_sources(page, archive: dict[tuple[str, ...], dict]) -> tuple[int, int, int]:
+    dom = extract_dom_rows(page)
+    structured = extract_structured_comments(page)
+    added = merge_rows(archive, dom)
+    added += merge_rows(archive, structured)
+    return len(dom), len(structured), added
+
+
 def load_more(page, rounds: int = 300) -> list[dict]:
-    """Expand, capture, and scroll until no new rows appear for several rounds."""
-    archive: dict[tuple[str, str, str], dict] = {}
+    """Expand, capture, and scroll until no new comment IDs appear."""
+    archive: dict[tuple[str, ...], dict] = {}
     quiet_rounds = 0
 
-    initial = extract_rows(page)
-    merge_rows(archive, initial)
-    print(f"Initial capture: {len(initial)} visible rows, {len(archive)} unique rows archived")
+    dom_n, structured_n, added = capture_all_sources(page, archive)
+    print(
+        f"Initial capture: DOM {dom_n}, structured {structured_n}, "
+        f"new +{added}, total unique {len(archive)}"
+    )
 
     for round_no in range(1, rounds + 1):
-        before = extract_rows(page)
-        added_before = merge_rows(archive, before)
-
+        _, _, added_before = capture_all_sources(page, archive)
         clicked = click_expanders(page)
         page.wait_for_timeout(350)
-
-        after_click = extract_rows(page)
-        added_click = merge_rows(archive, after_click)
-
+        _, _, added_click = capture_all_sources(page, archive)
         scroll_comment_surfaces(page)
         page.wait_for_timeout(800)
-
-        after_scroll = extract_rows(page)
-        added_scroll = merge_rows(archive, after_scroll)
+        dom_n, structured_n, added_scroll = capture_all_sources(page, archive)
 
         new_rows = added_before + added_click + added_scroll
-        visible_now = len(after_scroll)
+        comment_ids = sum(1 for row in archive.values() if row.get("comment_id"))
+        replies = sum(1 for row in archive.values() if row.get("parent_comment_id"))
 
         print(
-            f"Loading round {round_no}: visible {visible_now}, "
-            f"new +{new_rows}, total unique {len(archive)}, expand clicks {clicked}"
+            f"Loading round {round_no}: DOM {dom_n}, structured {structured_n}, "
+            f"new +{new_rows}, unique IDs {comment_ids}, replies {replies}, "
+            f"expand clicks {clicked}"
         )
 
         if new_rows == 0 and clicked == 0:
@@ -226,11 +314,10 @@ def load_more(page, rounds: int = 300) -> list[dict]:
             quiet_rounds = 0
 
         if quiet_rounds >= 8:
-            print("No new rows or expansion controls for 8 rounds; moving to final extraction.")
+            print("No new comment IDs or expansion controls for 8 rounds; stopping.")
             break
 
-    final_rows = extract_rows(page)
-    merge_rows(archive, final_rows)
+    capture_all_sources(page, archive)
     return list(archive.values())
 
 
@@ -258,10 +345,18 @@ def main() -> None:
         print("Automatically expanding, capturing, and scrolling comments/replies now...")
         rows = load_more(page)
 
-        print(f"Archived {len(rows)} unique candidate comment/caption rows across the whole run.")
-        for index, row in enumerate(rows[:15], start=1):
-            sample = row["text"].replace("\n", " | ")[:220]
-            print(f"{index}. @{row['username']} [{row['source']}]: {sample}")
+        comments = [row for row in rows if row.get("comment_id")]
+        replies = [row for row in comments if row.get("parent_comment_id")]
+        top_level = [row for row in comments if not row.get("parent_comment_id")]
+
+        print(
+            f"Archived {len(comments)} unique Instagram comment IDs: "
+            f"{len(top_level)} top-level, {len(replies)} replies."
+        )
+        for index, row in enumerate(comments[:15], start=1):
+            kind = "reply" if row.get("parent_comment_id") else "comment"
+            sample = row.get("text", "").replace("\n", " | ")[:220]
+            print(f"{index}. {kind} {row['comment_id']} @{row['username']}: {sample}")
 
         (DEBUG_DIR / f"{POST_CODE}_rows.json").write_text(
             json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -273,7 +368,6 @@ def main() -> None:
         page.screenshot(path=str(DEBUG_DIR / f"{POST_CODE}.png"), full_page=True)
 
         print(f"Saved debug output to {DEBUG_DIR}.")
-        print("You can close the browser after this script finishes.")
         context.close()
 
 
